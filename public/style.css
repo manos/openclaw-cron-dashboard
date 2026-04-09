@@ -845,6 +845,68 @@ code, pre {
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
 
+/* ─── Canvas Tooltip ───────────────────────────────────────────────────────── */
+
+.canvas-tooltip {
+  position: fixed;
+  z-index: 1000;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  max-width: 360px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-primary);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+
+.canvas-tooltip.visible {
+  opacity: 1;
+}
+
+.canvas-tooltip .tt-header {
+  font-weight: 600;
+  margin-bottom: 4px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.canvas-tooltip .tt-status {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.canvas-tooltip .tt-status.ok    { background: var(--green); }
+.canvas-tooltip .tt-status.error { background: var(--red); }
+.canvas-tooltip .tt-status.none  { background: var(--accent); }
+
+.canvas-tooltip .tt-meta {
+  color: var(--text-muted);
+  font-size: 11px;
+  margin-bottom: 4px;
+}
+
+.canvas-tooltip .tt-output {
+  color: var(--text-secondary);
+  font-family: var(--font-mono, 'SFMono-Regular', Consolas, monospace);
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 120px;
+  overflow: hidden;
+  border-top: 1px solid var(--border);
+  padding-top: 4px;
+  margin-top: 4px;
+}
+
 /* ─── Utility ──────────────────────────────────────────────────────────────── */
 
 .hidden { display: none !important; }

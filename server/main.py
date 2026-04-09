@@ -14,10 +14,11 @@ import os
 import signal
 import sys
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from .cron_reader import read_jobs
 from .run_history import get_run_history
@@ -42,6 +43,19 @@ app.add_middleware(
     allow_methods=["GET", "OPTIONS"],
     allow_headers=["Content-Type"],
 )
+
+
+# No-cache for static assets so code updates take effect immediately
+class NoCacheStaticMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        if not request.url.path.startswith("/api/"):
+            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+            response.headers["Pragma"] = "no-cache"
+        return response
+
+
+app.add_middleware(NoCacheStaticMiddleware)
 
 
 # ─── API Routes ────────────────────────────────────────────────────────────────
@@ -175,9 +189,16 @@ def weekly_runs():
                             if day not in jobs_data[job_id]:
                                 jobs_data[job_id][day] = []
 
+                            # Truncate summary for tooltip display
+                            summary = entry.get("summary") or ""
+                            if len(summary) > 200:
+                                summary = summary[:200] + "…"
+
                             jobs_data[job_id][day].append({
                                 "status": entry.get("status"),
                                 "ts": ts,
+                                "durationMs": entry.get("durationMs"),
+                                "summary": summary,
                             })
                 except (OSError, PermissionError):
                     continue

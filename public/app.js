@@ -24,6 +24,10 @@ let refreshTimer = null;
 let countdownTimer = null;
 let countdownRemaining = REFRESH_INTERVAL_MS;
 
+// Tooltip hitbox tracking: arrays of { x, y, r, data } for each canvas
+let dailyDotHits = [];
+let weeklyDotHits = [];
+
 // ─── DOM refs ─────────────────────────────────────────────────────────────────
 
 const $ = id => document.getElementById(id);
@@ -59,6 +63,7 @@ const dom = {
   panelBody:        $('panel-body'),
   panelCloseBtn:    $('panel-close-btn'),
   toastContainer:   $('toast-container'),
+  tooltip:          $('canvas-tooltip'),
 };
 
 // ─── Bootstrap ────────────────────────────────────────────────────────────────
@@ -82,6 +87,12 @@ function setupEventListeners() {
 
   dom.tabToday.addEventListener('click', () => switchView('today'));
   dom.tabWeek.addEventListener('click', () => switchView('week'));
+
+  // Canvas tooltip hover
+  dom.timelineCanvas.addEventListener('mousemove', e => handleCanvasHover(e, dom.timelineCanvas, dailyDotHits));
+  dom.timelineCanvas.addEventListener('mouseleave', hideTooltip);
+  dom.weeklyCanvas.addEventListener('mousemove', e => handleCanvasHover(e, dom.weeklyCanvas, weeklyDotHits));
+  dom.weeklyCanvas.addEventListener('mouseleave', hideTooltip);
 
   // Keyboard shortcuts
   document.addEventListener('keydown', e => {
@@ -193,6 +204,7 @@ function showError(message) {
 function renderTimeline(jobs) {
   const canvas = dom.timelineCanvas;
   const ctx = canvas.getContext('2d');
+  dailyDotHits = [];  // reset hitboxes
 
   const enabledJobs = jobs.filter(j => j.enabled && j.firingFractions?.length > 0);
 
@@ -321,6 +333,19 @@ function renderTimeline(jobs) {
       ctx.beginPath();
       ctx.arc(dotX, rowCenterY, DOT_RADIUS, 0, Math.PI * 2);
       ctx.fill();
+
+      // Record hitbox for tooltip
+      const hours = Math.floor(fraction * 24);
+      const mins = Math.floor((fraction * 24 - hours) * 60);
+      dailyDotHits.push({
+        x: dotX, y: rowCenterY, r: DOT_RADIUS * 2.5,
+        data: {
+          name: job.name,
+          time: `${String(hours).padStart(2,'0')}:${String(mins).padStart(2,'0')}`,
+          status: lastStatus,
+          schedule: job.scheduleHuman || '',
+        }
+      });
     }
   });
 
@@ -377,6 +402,7 @@ function switchView(view) {
 function renderWeeklyTimeline(jobs, weeklyRunsData) {
   const canvas = dom.weeklyCanvas;
   const ctx = canvas.getContext('2d');
+  weeklyDotHits = [];  // reset hitboxes
 
   const enabledJobs = jobs.filter(j => j.enabled && j.weeklyFiringFractions);
 
@@ -568,6 +594,23 @@ function renderWeeklyTimeline(jobs, weeklyRunsData) {
         ctx.beginPath();
         ctx.arc(dotX, rowCenterY, DOT_RADIUS, 0, Math.PI * 2);
         ctx.fill();
+
+        // Record hitbox for tooltip
+        const hours = Math.floor(frac * 24);
+        const mins = Math.floor((frac * 24 - hours) * 60);
+        // Find the closest matching run for this dot's time
+        const closestRun = _findClosestRun(dayRuns, hours, mins);
+        weeklyDotHits.push({
+          x: dotX, y: rowCenterY, r: DOT_RADIUS * 2.5,
+          data: {
+            name: job.name,
+            day: dayLabels[colIdx] + ' ' + weekDates[colIdx].toLocaleDateString(undefined, { month: 'numeric', day: 'numeric' }),
+            time: `${String(hours).padStart(2,'0')}:${String(mins).padStart(2,'0')}`,
+            status: closestRun?.status || (dateStr <= todayStr ? dayStatus : null),
+            summary: closestRun?.summary || null,
+            durationMs: closestRun?.durationMs || null,
+          }
+        });
       }
     });
   });
@@ -603,6 +646,113 @@ function _weekDayStatus(dayRuns) {
   if (hasError) return 'error';
   const hasOk = dayRuns.some(r => r.status === 'ok');
   return hasOk ? 'ok' : 'none';
+}
+
+/**
+ * Find the run entry closest to a given hour:minute in a day's runs.
+ */
+function _findClosestRun(dayRuns, targetHours, targetMins) {
+  if (!dayRuns || dayRuns.length === 0) return null;
+  const targetMinOfDay = targetHours * 60 + targetMins;
+  let closest = null;
+  let minDiff = Infinity;
+  for (const run of dayRuns) {
+    if (!run.ts) continue;
+    const d = new Date(run.ts);
+    const runMinOfDay = d.getUTCHours() * 60 + d.getUTCMinutes();
+    const diff = Math.abs(runMinOfDay - targetMinOfDay);
+    if (diff < minDiff) {
+      minDiff = diff;
+      closest = run;
+    }
+  }
+  // Only match if within 30 minutes
+  return minDiff <= 30 ? closest : null;
+}
+
+// ─── Canvas Tooltip ───────────────────────────────────────────────────────────
+
+/**
+ * Handle mousemove on a canvas, showing a tooltip when hovering near a dot.
+ */
+function handleCanvasHover(event, canvas, hitboxes) {
+  const rect = canvas.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  // Mouse position in CSS pixels relative to canvas
+  const mx = event.clientX - rect.left;
+  const my = event.clientY - rect.top;
+
+  // Find the nearest dot within its radius
+  let hit = null;
+  let minDist = Infinity;
+  for (const dot of hitboxes) {
+    const dx = mx - dot.x;
+    const dy = my - dot.y;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    if (dist <= dot.r * 1.5 && dist < minDist) {
+      minDist = dist;
+      hit = dot;
+    }
+  }
+
+  if (hit) {
+    showTooltipAt(event.clientX, event.clientY, hit.data);
+  } else {
+    hideTooltip();
+  }
+}
+
+/**
+ * Show the tooltip near the cursor with formatted content.
+ */
+function showTooltipAt(clientX, clientY, data) {
+  const tt = dom.tooltip;
+  if (!tt) return;
+
+  const statusClass = data.status === 'ok' ? 'ok' : data.status === 'error' ? 'error' : 'none';
+  const statusLabel = data.status === 'ok' ? 'OK' : data.status === 'error' ? 'Error' : data.status === 'timeout' ? 'Timeout' : 'Scheduled';
+
+  let html = `<div class="tt-header"><span class="tt-status ${statusClass}"></span>${escHtml(data.name)}</div>`;
+
+  const meta = [];
+  if (data.day) meta.push(data.day);
+  if (data.time) meta.push(data.time);
+  meta.push(statusLabel);
+  if (data.durationMs) meta.push(formatDuration(data.durationMs));
+  if (data.schedule && !data.day) meta.push(data.schedule);
+  html += `<div class="tt-meta">${escHtml(meta.join(' · '))}</div>`;
+
+  if (data.summary) {
+    html += `<div class="tt-output">${escHtml(data.summary)}</div>`;
+  }
+
+  tt.innerHTML = html;
+  tt.classList.add('visible');
+
+  // Position: offset from cursor, clamped to viewport
+  const pad = 12;
+  let left = clientX + pad;
+  let top = clientY + pad;
+
+  // Measure after setting content
+  const ttRect = tt.getBoundingClientRect();
+  if (left + ttRect.width > window.innerWidth - pad) {
+    left = clientX - ttRect.width - pad;
+  }
+  if (top + ttRect.height > window.innerHeight - pad) {
+    top = clientY - ttRect.height - pad;
+  }
+
+  tt.style.left = `${Math.max(pad, left)}px`;
+  tt.style.top = `${Math.max(pad, top)}px`;
+}
+
+/**
+ * Hide the canvas tooltip.
+ */
+function hideTooltip() {
+  const tt = dom.tooltip;
+  if (tt) tt.classList.remove('visible');
 }
 
 /**
