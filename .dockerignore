@@ -1,0 +1,14 @@
+__pycache__
+*.py[cod]
+.venv
+venv
+node_modules
+.git
+.gitignore
+.env
+.env.local
+README.md
+LICENSE
+docs/
+.DS_Store
+Thumbs.db

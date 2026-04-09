@@ -1,0 +1,44 @@
+# OpenClaw Cron Dashboard — example Docker Compose configuration
+#
+# Usage:
+#   1. Copy this file to your working directory
+#   2. Adjust the volume mount to point to your ~/.openclaw/cron directory
+#   3. If the openclaw binary is available on the host, bind-mount it (see below)
+#   4. Run: docker compose up -d
+#
+# The dashboard will be available at http://localhost:3000
+
+services:
+  cron-dashboard:
+    image: ghcr.io/your-org/openclaw-cron-dashboard:latest
+    # Or build locally:
+    # build: .
+    container_name: openclaw-cron-dashboard
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      # Path inside the container where cron data is mounted
+      OPENCLAW_CRON_DIR: /data/cron
+
+      # Path to the openclaw binary inside the container.
+      # If you bind-mount the host binary (see volumes below), set this path.
+      # If openclaw is not available, run history will return empty results.
+      OPENCLAW_BIN: /usr/local/bin/openclaw
+
+      PORT: "3000"
+    volumes:
+      # Mount your OpenClaw cron directory (read-only)
+      # Replace ~/.openclaw/cron with the actual path on your host
+      - ${HOME}/.openclaw/cron:/data/cron:ro
+
+      # Optional: bind-mount the openclaw binary so run history works
+      # Uncomment and adjust the path to your openclaw installation:
+      # - /usr/local/bin/openclaw:/usr/local/bin/openclaw:ro
+
+    # Resource limits (optional, adjust to taste)
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: '0.5'
+    #       memory: 128M

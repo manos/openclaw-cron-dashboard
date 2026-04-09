@@ -1,0 +1,755 @@
+/**
+ * OpenClaw Cron Dashboard — Frontend
+ *
+ * Fetches job data from the local API, renders a 24h timeline,
+ * job cards, and a run history panel with output summaries.
+ * Auto-refreshes every 30 seconds.
+ */
+
+'use strict';
+
+// ─── Configuration ────────────────────────────────────────────────────────────
+
+const REFRESH_INTERVAL_MS = 30_000; // 30 seconds
+const API_BASE = ''; // same origin
+
+// ─── State ────────────────────────────────────────────────────────────────────
+
+let allJobs = [];
+let serverTz = null;
+let activeJobId = null;
+let refreshTimer = null;
+let countdownTimer = null;
+let countdownRemaining = REFRESH_INTERVAL_MS;
+
+// ─── DOM refs ─────────────────────────────────────────────────────────────────
+
+const $ = id => document.getElementById(id);
+
+const dom = {
+  statusDot:        $('status-dot'),
+  lastUpdated:      $('last-updated'),
+  refreshBtn:       $('refresh-btn'),
+  refreshBar:       $('refresh-bar'),
+  refreshCountdown: $('refresh-countdown'),
+  loadingState:     $('loading-state'),
+  errorState:       $('error-state'),
+  errorMessage:     $('error-message'),
+  emptyState:       $('empty-state'),
+  emptyCronDir:     $('empty-cron-dir'),
+  jobsGrid:         $('jobs-grid'),
+  jobsCountBadge:   $('jobs-count-badge'),
+  statTotal:        $('stat-total'),
+  statOk:           $('stat-ok'),
+  statErrors:       $('stat-errors'),
+  statDisabled:     $('stat-disabled'),
+  timelineTzBadge:  $('timeline-tz-badge'),
+  timelineCanvas:   $('timeline-canvas'),
+  panelOverlay:     $('panel-overlay'),
+  runPanel:         $('run-panel'),
+  panelJobName:     $('panel-job-name'),
+  panelJobSchedule: $('panel-job-schedule'),
+  panelBody:        $('panel-body'),
+  panelCloseBtn:    $('panel-close-btn'),
+  toastContainer:   $('toast-container'),
+};
+
+// ─── Bootstrap ────────────────────────────────────────────────────────────────
+
+document.addEventListener('DOMContentLoaded', () => {
+  setupEventListeners();
+  loadJobs();
+  startAutoRefresh();
+});
+
+// ─── Event Listeners ─────────────────────────────────────────────────────────
+
+function setupEventListeners() {
+  dom.refreshBtn.addEventListener('click', () => {
+    resetAutoRefresh();
+    loadJobs();
+  });
+
+  dom.panelCloseBtn.addEventListener('click', closePanel);
+  dom.panelOverlay.addEventListener('click', closePanel);
+
+  // Keyboard shortcuts
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') closePanel();
+    if (e.key === 'r' && !e.ctrlKey && !e.metaKey && !e.shiftKey) {
+      const active = document.activeElement;
+      const isInput = active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA');
+      if (!isInput) {
+        resetAutoRefresh();
+        loadJobs();
+      }
+    }
+  });
+}
+
+// ─── Data Fetching ────────────────────────────────────────────────────────────
+
+async function loadJobs() {
+  setStatus('loading');
+  dom.refreshBtn.classList.add('spinning');
+
+  try {
+    const res = await fetch(`${API_BASE}/api/jobs`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+
+    const data = await res.json();
+    allJobs = data.jobs || [];
+    serverTz = data.serverTz || null;
+
+    renderAll(allJobs);
+    setStatus('ok');
+    dom.lastUpdated.textContent = `Updated ${formatTimeAgo(Date.now())}`;
+  } catch (err) {
+    console.error('[dashboard] Failed to load jobs:', err);
+    setStatus('error');
+    showError(err.message);
+  } finally {
+    dom.refreshBtn.classList.remove('spinning');
+  }
+}
+
+async function loadRunHistory(jobId) {
+  const res = await fetch(`${API_BASE}/api/jobs/${encodeURIComponent(jobId)}/runs`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+  return res.json();
+}
+
+// ─── Rendering ────────────────────────────────────────────────────────────────
+
+function renderAll(jobs) {
+  // Update stats
+  const enabled = jobs.filter(j => j.enabled);
+  const disabled = jobs.filter(j => !j.enabled);
+  const okJobs = jobs.filter(j => j.state?.lastRunStatus === 'ok');
+  const errJobs = jobs.filter(j => j.state?.consecutiveErrors > 0);
+
+  dom.statTotal.textContent = jobs.length;
+  dom.statOk.textContent = okJobs.length;
+  dom.statErrors.textContent = errJobs.length;
+  dom.statDisabled.textContent = disabled.length;
+  dom.jobsCountBadge.textContent = jobs.length;
+
+  // Timeline
+  if (serverTz) {
+    dom.timelineTzBadge.textContent = serverTz;
+  }
+  renderTimeline(jobs);
+
+  // Job cards
+  renderJobCards(jobs);
+
+  // Show appropriate state
+  dom.loadingState.classList.add('hidden');
+  dom.errorState.classList.add('hidden');
+
+  if (jobs.length === 0) {
+    dom.emptyState.classList.remove('hidden');
+    dom.jobsGrid.innerHTML = '';
+  } else {
+    dom.emptyState.classList.add('hidden');
+  }
+}
+
+function showError(message) {
+  dom.loadingState.classList.add('hidden');
+  dom.emptyState.classList.add('hidden');
+  dom.errorState.classList.remove('hidden');
+  dom.errorMessage.textContent = message || 'Unknown error';
+}
+
+// ─── Timeline ─────────────────────────────────────────────────────────────────
+
+/**
+ * Draw the 24-hour schedule timeline on a canvas element.
+ * Each job gets a row; firing times are shown as colored dots.
+ * The current time is marked with a vertical line.
+ */
+function renderTimeline(jobs) {
+  const canvas = dom.timelineCanvas;
+  const ctx = canvas.getContext('2d');
+
+  const enabledJobs = jobs.filter(j => j.enabled && j.firingFractions?.length > 0);
+
+  // Layout constants
+  const PADDING_LEFT  = 140; // space for job names
+  const PADDING_RIGHT = 20;
+  const HOUR_LABEL_HEIGHT = 28;
+  const ROW_HEIGHT = 28;
+  const DOT_RADIUS = 4;
+  const NOW_LINE_WIDTH = 1.5;
+
+  const totalRows = Math.max(enabledJobs.length, 1);
+  const canvasHeight = HOUR_LABEL_HEIGHT + totalRows * ROW_HEIGHT + 16;
+
+  // Use device pixel ratio for sharp rendering on HiDPI screens
+  const dpr = window.devicePixelRatio || 1;
+  const displayWidth = canvas.parentElement.clientWidth || 800;
+
+  canvas.width = displayWidth * dpr;
+  canvas.height = canvasHeight * dpr;
+  canvas.style.width = `${displayWidth}px`;
+  canvas.style.height = `${canvasHeight}px`;
+  ctx.scale(dpr, dpr);
+
+  const trackWidth = displayWidth - PADDING_LEFT - PADDING_RIGHT;
+
+  // CSS custom property colors (read from computed style)
+  const style = getComputedStyle(document.documentElement);
+  const colors = {
+    bgSurface:    style.getPropertyValue('--bg-surface').trim()  || '#161b22',
+    border:       style.getPropertyValue('--border').trim()      || '#30363d',
+    textMuted:    style.getPropertyValue('--text-muted').trim()  || '#6e7681',
+    textSecondary:style.getPropertyValue('--text-secondary').trim() || '#8b949e',
+    textPrimary:  style.getPropertyValue('--text-primary').trim() || '#e6edf3',
+    accent:       style.getPropertyValue('--accent').trim()      || '#58a6ff',
+    green:        style.getPropertyValue('--green').trim()       || '#3fb950',
+    red:          style.getPropertyValue('--red').trim()         || '#f85149',
+    yellow:       style.getPropertyValue('--yellow').trim()      || '#d29922',
+  };
+
+  // Background
+  ctx.fillStyle = colors.bgSurface;
+  ctx.fillRect(0, 0, displayWidth, canvasHeight);
+
+  // Hour grid lines and labels
+  const hours = [0, 3, 6, 9, 12, 15, 18, 21, 24];
+  ctx.font = `11px ${getComputedStyle(document.body).getPropertyValue('font-family')}`;
+  ctx.textAlign = 'center';
+
+  for (const hour of hours) {
+    const x = PADDING_LEFT + (hour / 24) * trackWidth;
+
+    // Vertical grid line
+    ctx.strokeStyle = colors.border;
+    ctx.lineWidth = hour === 0 || hour === 24 ? 1.5 : 0.5;
+    ctx.beginPath();
+    ctx.moveTo(x, HOUR_LABEL_HEIGHT - 6);
+    ctx.lineTo(x, canvasHeight - 4);
+    ctx.stroke();
+
+    // Hour label
+    ctx.fillStyle = colors.textMuted;
+    const label = hour === 24 ? '0' : String(hour).padStart(2, '0') + ':00';
+    ctx.fillText(label, x, 16);
+  }
+
+  // No jobs with firing times — show placeholder
+  if (enabledJobs.length === 0) {
+    ctx.fillStyle = colors.textMuted;
+    ctx.textAlign = 'center';
+    ctx.font = `13px ${getComputedStyle(document.body).getPropertyValue('font-family')}`;
+    ctx.fillText('No scheduled jobs with computable firing times', displayWidth / 2, HOUR_LABEL_HEIGHT + ROW_HEIGHT * 0.7);
+    return;
+  }
+
+  // Draw rows for each job
+  enabledJobs.forEach((job, rowIdx) => {
+    const y = HOUR_LABEL_HEIGHT + rowIdx * ROW_HEIGHT;
+    const rowCenterY = y + ROW_HEIGHT / 2;
+
+    // Alternating row background
+    if (rowIdx % 2 === 1) {
+      ctx.fillStyle = 'rgba(255,255,255,0.02)';
+      ctx.fillRect(0, y, displayWidth, ROW_HEIGHT);
+    }
+
+    // Track line
+    ctx.strokeStyle = colors.border;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(PADDING_LEFT, rowCenterY);
+    ctx.lineTo(PADDING_LEFT + trackWidth, rowCenterY);
+    ctx.stroke();
+
+    // Job name label (truncated)
+    const maxNameWidth = PADDING_LEFT - 12;
+    ctx.fillStyle = colors.textSecondary;
+    ctx.textAlign = 'right';
+    ctx.font = `12px ${getComputedStyle(document.body).getPropertyValue('font-family')}`;
+    const displayName = truncateText(ctx, job.name, maxNameWidth);
+    ctx.fillText(displayName, PADDING_LEFT - 10, rowCenterY + 4);
+
+    // Determine dot color based on last status
+    const lastStatus = job.state?.lastRunStatus;
+    let dotColor;
+    if (lastStatus === 'ok')       dotColor = colors.green;
+    else if (lastStatus === 'error') dotColor = colors.red;
+    else                             dotColor = colors.accent;
+
+    // Draw dots at each firing time
+    const fractions = job.firingFractions || [];
+    for (const fraction of fractions) {
+      const dotX = PADDING_LEFT + fraction * trackWidth;
+
+      // Glow effect
+      const gradient = ctx.createRadialGradient(dotX, rowCenterY, 0, dotX, rowCenterY, DOT_RADIUS * 2.5);
+      gradient.addColorStop(0, dotColor + 'aa');
+      gradient.addColorStop(1, dotColor + '00');
+      ctx.fillStyle = gradient;
+      ctx.beginPath();
+      ctx.arc(dotX, rowCenterY, DOT_RADIUS * 2.5, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Solid dot
+      ctx.fillStyle = dotColor;
+      ctx.beginPath();
+      ctx.arc(dotX, rowCenterY, DOT_RADIUS, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  });
+
+  // Current time indicator
+  const now = new Date();
+  const nowFraction = (now.getHours() * 3600 + now.getMinutes() * 60 + now.getSeconds()) / 86400;
+  const nowX = PADDING_LEFT + nowFraction * trackWidth;
+
+  ctx.strokeStyle = colors.red + 'cc';
+  ctx.lineWidth = NOW_LINE_WIDTH;
+  ctx.setLineDash([4, 3]);
+  ctx.beginPath();
+  ctx.moveTo(nowX, HOUR_LABEL_HEIGHT - 6);
+  ctx.lineTo(nowX, canvasHeight - 4);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Current time label
+  ctx.fillStyle = colors.red;
+  ctx.textAlign = 'center';
+  ctx.font = `bold 10px ${getComputedStyle(document.body).getPropertyValue('font-family')}`;
+  const nowLabel = `${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}`;
+  ctx.fillText(nowLabel, Math.min(Math.max(nowX, 25), displayWidth - 25), 10);
+}
+
+/**
+ * Truncate text to fit within maxWidth pixels, appending ellipsis if needed.
+ */
+function truncateText(ctx, text, maxWidth) {
+  if (ctx.measureText(text).width <= maxWidth) return text;
+  let truncated = text;
+  while (truncated.length > 0 && ctx.measureText(truncated + '…').width > maxWidth) {
+    truncated = truncated.slice(0, -1);
+  }
+  return truncated + '…';
+}
+
+// ─── Job Cards ────────────────────────────────────────────────────────────────
+
+function renderJobCards(jobs) {
+  // Sort: errors first, then by name
+  const sorted = [...jobs].sort((a, b) => {
+    const aErr = (a.state?.consecutiveErrors || 0) > 0;
+    const bErr = (b.state?.consecutiveErrors || 0) > 0;
+    if (aErr && !bErr) return -1;
+    if (!aErr && bErr) return 1;
+    return (a.name || '').localeCompare(b.name || '');
+  });
+
+  dom.jobsGrid.innerHTML = sorted.map(job => renderJobCard(job)).join('');
+
+  // Attach click handlers
+  dom.jobsGrid.querySelectorAll('.job-card').forEach(card => {
+    card.addEventListener('click', () => {
+      const jobId = card.dataset.jobId;
+      openPanel(jobId);
+    });
+  });
+
+  // Mark active card if panel is open
+  if (activeJobId) {
+    const activeCard = dom.jobsGrid.querySelector(`[data-job-id="${activeJobId}"]`);
+    activeCard?.classList.add('active');
+  }
+}
+
+function renderJobCard(job) {
+  const state = job.state || {};
+  const status = state.lastRunStatus || null;
+  const errors = state.consecutiveErrors || 0;
+
+  const statusIcon = statusEmoji(status);
+  const statusClass = status === 'ok' ? 'ok' : status === 'error' ? 'error' : '';
+
+  const enabledClass = job.enabled ? 'enabled' : 'disabled';
+  const enabledLabel = job.enabled ? 'enabled' : 'disabled';
+
+  const lastRun = state.lastRunAtMs
+    ? `${statusIcon} ${formatTimeAgo(state.lastRunAtMs)}`
+    : '—';
+
+  const nextRun = state.nextRunAtMs
+    ? formatNextRun(state.nextRunAtMs)
+    : '—';
+
+  const duration = state.lastDurationMs
+    ? formatDuration(state.lastDurationMs)
+    : '—';
+
+  const cardStatusClass = errors > 0 ? 'status-error' : (status === 'ok' ? 'status-ok' : '');
+
+  const tags = [];
+  if (job.model) {
+    const shortModel = job.model.split('/').pop() || job.model;
+    tags.push(`<span class="job-meta-tag" title="${escHtml(job.model)}">${escHtml(shortModel)}</span>`);
+  }
+  if (job.channel) {
+    tags.push(`<span class="job-meta-tag">${escHtml(job.channel)}</span>`);
+  }
+  if (errors > 0) {
+    tags.push(`<span class="error-count-badge">${errors} error${errors !== 1 ? 's' : ''}</span>`);
+  }
+
+  return `
+    <div class="job-card ${cardStatusClass} ${job.enabled ? '' : 'disabled'}"
+         data-job-id="${escHtml(job.id)}"
+         role="button"
+         tabindex="0"
+         aria-label="View run history for ${escHtml(job.name)}"
+         title="Click to view run history">
+      <div class="job-card-header">
+        <div class="job-name">${escHtml(job.name)}</div>
+        <span class="job-enabled-badge ${enabledClass}">${enabledLabel}</span>
+      </div>
+
+      <div class="job-schedule">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="10"/>
+          <polyline points="12 6 12 12 16 14"/>
+        </svg>
+        ${escHtml(job.scheduleHuman || 'Unknown schedule')}
+      </div>
+
+      <div class="job-stats">
+        <div class="job-stat">
+          <span class="job-stat-label">Last Run</span>
+          <span class="job-stat-value ${statusClass}">${lastRun}</span>
+        </div>
+        <div class="job-stat">
+          <span class="job-stat-label">Duration</span>
+          <span class="job-stat-value">${duration}</span>
+        </div>
+        <div class="job-stat">
+          <span class="job-stat-label">Next Run</span>
+          <span class="job-stat-value">${escHtml(nextRun)}</span>
+        </div>
+        <div class="job-stat">
+          <span class="job-stat-label">Delivery</span>
+          <span class="job-stat-value">${escHtml(state.lastDeliveryStatus || '—')}</span>
+        </div>
+      </div>
+
+      ${tags.length > 0 ? `
+      <div class="job-card-footer">
+        ${tags.join('')}
+      </div>` : ''}
+    </div>
+  `;
+}
+
+// ─── Run History Panel ────────────────────────────────────────────────────────
+
+async function openPanel(jobId) {
+  const job = allJobs.find(j => j.id === jobId);
+  if (!job) return;
+
+  activeJobId = jobId;
+
+  // Update active card styling
+  dom.jobsGrid.querySelectorAll('.job-card').forEach(c => c.classList.remove('active'));
+  const activeCard = dom.jobsGrid.querySelector(`[data-job-id="${jobId}"]`);
+  activeCard?.classList.add('active');
+
+  // Set panel header
+  dom.panelJobName.textContent = job.name;
+  dom.panelJobSchedule.textContent = job.scheduleHuman || '';
+
+  // Show panel with loading state
+  dom.panelBody.innerHTML = `
+    <div class="panel-loading" aria-label="Loading run history">
+      <div class="spinner"></div>
+      <span>Loading run history…</span>
+    </div>
+  `;
+
+  dom.panelOverlay.classList.add('open');
+  dom.panelOverlay.setAttribute('aria-hidden', 'false');
+  dom.runPanel.classList.add('open');
+  dom.runPanel.setAttribute('aria-hidden', 'false');
+
+  // Fetch run history
+  try {
+    const data = await loadRunHistory(jobId);
+    renderRunHistory(data);
+  } catch (err) {
+    dom.panelBody.innerHTML = `
+      <div class="panel-error">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <circle cx="12" cy="12" r="10"/>
+          <line x1="12" y1="8" x2="12" y2="12"/>
+          <line x1="12" y1="16" x2="12.01" y2="16"/>
+        </svg>
+        <span>${escHtml(err.message)}</span>
+      </div>
+    `;
+  }
+}
+
+function closePanel() {
+  activeJobId = null;
+  dom.panelOverlay.classList.remove('open');
+  dom.panelOverlay.setAttribute('aria-hidden', 'true');
+  dom.runPanel.classList.remove('open');
+  dom.runPanel.setAttribute('aria-hidden', 'true');
+  dom.jobsGrid.querySelectorAll('.job-card').forEach(c => c.classList.remove('active'));
+}
+
+function renderRunHistory(data) {
+  const entries = data.entries || [];
+  const error = data.error;
+
+  if (entries.length === 0) {
+    dom.panelBody.innerHTML = `
+      <div class="panel-empty">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <rect x="3" y="4" width="18" height="18" rx="2"/>
+          <line x1="16" y1="2" x2="16" y2="6"/>
+          <line x1="8" y1="2" x2="8" y2="6"/>
+          <line x1="3" y1="10" x2="21" y2="10"/>
+        </svg>
+        <span>${error ? escHtml(error) : 'No run history yet'}</span>
+      </div>
+    `;
+    return;
+  }
+
+  const html = entries.map((entry, idx) => renderRunEntry(entry, idx)).join('');
+  dom.panelBody.innerHTML = `<div class="run-list">${html}</div>`;
+
+  // Expand the most recent run by default
+  const firstEntry = dom.panelBody.querySelector('.run-entry');
+  if (firstEntry) toggleRunEntry(firstEntry);
+
+  // Attach toggle handlers
+  dom.panelBody.querySelectorAll('.run-entry-header').forEach(header => {
+    header.addEventListener('click', () => {
+      toggleRunEntry(header.closest('.run-entry'));
+    });
+    header.addEventListener('keydown', e => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        toggleRunEntry(header.closest('.run-entry'));
+      }
+    });
+  });
+}
+
+function toggleRunEntry(entry) {
+  entry.classList.toggle('expanded');
+}
+
+function renderRunEntry(entry, idx) {
+  const ts = entry.runAtMs || entry.ts;
+  const icon = statusEmoji(entry.status);
+  const timeStr = ts ? formatDateTime(ts) : '—';
+  const timeAgo = ts ? formatTimeAgo(ts) : '';
+  const duration = entry.durationMs ? formatDuration(entry.durationMs) : '—';
+  const model = entry.model || '';
+  const summary = entry.summary || null;
+
+  const deliveryClass = entry.deliveryStatus === 'delivered' ? '' : 'failed';
+  const deliveryLabel = entry.deliveryStatus || (entry.delivered === true ? 'delivered' : entry.delivered === false ? 'not delivered' : '—');
+
+  const tokenInfo = entry.usage
+    ? `<div class="run-tokens">
+        <span title="Input tokens">↑ ${entry.usage.inputTokens.toLocaleString()}</span>
+        <span title="Output tokens">↓ ${entry.usage.outputTokens.toLocaleString()}</span>
+        <span title="Total tokens">∑ ${entry.usage.totalTokens.toLocaleString()}</span>
+       </div>`
+    : '';
+
+  const outputSection = summary
+    ? `<div class="run-output-label">Output</div>
+       <pre class="run-output-text">${escHtml(summary)}</pre>
+       ${tokenInfo}`
+    : `<div class="run-output-label">Output</div>
+       <div class="run-output-text" style="color:var(--text-muted);font-style:italic">No output recorded</div>`;
+
+  return `
+    <div class="run-entry" data-idx="${idx}" role="article">
+      <div class="run-entry-header" role="button" tabindex="0" aria-expanded="false"
+           aria-label="${icon} ${timeStr} — ${entry.status || 'unknown'}">
+        <span class="run-status-icon" aria-hidden="true">${icon}</span>
+        <div class="run-time">
+          <div class="run-timestamp">${timeStr}</div>
+          <div class="run-time-ago">${escHtml(timeAgo)}</div>
+        </div>
+        <div class="run-meta">
+          <span class="run-duration">${escHtml(duration)}</span>
+          ${model ? `<span class="run-model" title="${escHtml(model)}">${escHtml(model.split('/').pop() || model)}</span>` : ''}
+          ${deliveryLabel !== '—' ? `<span class="run-delivery ${deliveryClass}">${escHtml(deliveryLabel)}</span>` : ''}
+        </div>
+        <span class="run-expand-icon" aria-hidden="true">▶</span>
+      </div>
+      <div class="run-output">
+        ${outputSection}
+      </div>
+    </div>
+  `;
+}
+
+// ─── Auto-refresh ─────────────────────────────────────────────────────────────
+
+function startAutoRefresh() {
+  resetAutoRefresh();
+}
+
+function resetAutoRefresh() {
+  if (refreshTimer) clearTimeout(refreshTimer);
+  if (countdownTimer) clearInterval(countdownTimer);
+
+  countdownRemaining = REFRESH_INTERVAL_MS;
+  updateCountdown();
+
+  countdownTimer = setInterval(() => {
+    countdownRemaining -= 1000;
+    updateCountdown();
+  }, 1000);
+
+  refreshTimer = setTimeout(() => {
+    clearInterval(countdownTimer);
+    loadJobs().then(() => resetAutoRefresh());
+  }, REFRESH_INTERVAL_MS);
+}
+
+function updateCountdown() {
+  const seconds = Math.max(0, Math.round(countdownRemaining / 1000));
+  dom.refreshCountdown.textContent = `${seconds}s`;
+  const pct = ((REFRESH_INTERVAL_MS - countdownRemaining) / REFRESH_INTERVAL_MS) * 100;
+  dom.refreshBar.style.width = `${Math.min(100, pct)}%`;
+  dom.refreshBar.style.transition = `width 1s linear`;
+}
+
+// ─── Status ───────────────────────────────────────────────────────────────────
+
+function setStatus(status) {
+  dom.statusDot.className = 'status-dot';
+  if (status === 'loading') dom.statusDot.classList.add('loading');
+  if (status === 'error') dom.statusDot.classList.add('error');
+}
+
+// ─── Toast Notifications ──────────────────────────────────────────────────────
+
+function showToast(message, type = '') {
+  const el = document.createElement('div');
+  el.className = `toast ${type}`;
+  el.textContent = message;
+  dom.toastContainer.appendChild(el);
+  setTimeout(() => el.remove(), 3200);
+}
+
+// ─── Formatting Utilities ─────────────────────────────────────────────────────
+
+/**
+ * Format a timestamp as a human-readable "time ago" string.
+ */
+function formatTimeAgo(ts) {
+  const diff = Date.now() - ts;
+  const abs = Math.abs(diff);
+  const future = diff < 0;
+
+  if (abs < 60_000)        return future ? 'in a moment'  : 'just now';
+  if (abs < 3_600_000)     return `${future ? 'in ' : ''}${Math.floor(abs / 60_000)}m${future ? '' : ' ago'}`;
+  if (abs < 86_400_000)    return `${future ? 'in ' : ''}${Math.floor(abs / 3_600_000)}h${future ? '' : ' ago'}`;
+  if (abs < 7 * 86_400_000) return `${future ? 'in ' : ''}${Math.floor(abs / 86_400_000)}d${future ? '' : ' ago'}`;
+  return formatDate(ts);
+}
+
+/**
+ * Format a next-run timestamp compactly.
+ */
+function formatNextRun(ts) {
+  if (!ts) return '—';
+  const diff = ts - Date.now();
+  if (diff < 0) return 'overdue';
+
+  const mins  = Math.floor(diff / 60_000);
+  const hours = Math.floor(diff / 3_600_000);
+
+  if (mins < 1)   return 'in <1m';
+  if (mins < 60)  return `in ${mins}m`;
+  if (hours < 24) return `in ${hours}h ${Math.floor((diff % 3_600_000) / 60_000)}m`;
+
+  return formatDateTime(ts);
+}
+
+/**
+ * Format duration in milliseconds to a human-readable string.
+ */
+function formatDuration(ms) {
+  if (!ms || ms < 0) return '—';
+  if (ms < 1000) return `${ms}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  const m = Math.floor(ms / 60_000);
+  const s = Math.floor((ms % 60_000) / 1000);
+  return `${m}m ${s}s`;
+}
+
+/**
+ * Format a timestamp as a short date string.
+ */
+function formatDate(ts) {
+  const d = new Date(ts);
+  return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+}
+
+/**
+ * Format a timestamp as a full date+time string.
+ */
+function formatDateTime(ts) {
+  const d = new Date(ts);
+  return d.toLocaleString(undefined, {
+    month: 'short', day: 'numeric',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+    hour12: false,
+  });
+}
+
+/**
+ * Map a run status to an emoji icon.
+ */
+function statusEmoji(status) {
+  switch (status) {
+    case 'ok':      return '✅';
+    case 'error':   return '❌';
+    case 'skipped': return '⏭️';
+    case 'timeout': return '⏱️';
+    default:        return '⬜';
+  }
+}
+
+/**
+ * Escape HTML special characters to prevent XSS.
+ */
+function escHtml(str) {
+  if (str === null || str === undefined) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// ─── Resize Timeline on Window Resize ─────────────────────────────────────────
+
+let resizeDebounce;
+window.addEventListener('resize', () => {
+  clearTimeout(resizeDebounce);
+  resizeDebounce = setTimeout(() => {
+    if (allJobs.length > 0) renderTimeline(allJobs);
+  }, 150);
+});

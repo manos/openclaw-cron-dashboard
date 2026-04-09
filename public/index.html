@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OpenClaw Cron Dashboard</title>
+  <link rel="stylesheet" href="style.css" />
+  <meta name="description" content="Visualize your OpenClaw cron jobs — schedules, status, run history, and output." />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='28' font-size='28'>🦞</text></svg>" />
+</head>
+<body>
+<div class="app-wrapper">
+
+  <!-- ── Header ──────────────────────────────────────────────────────────── -->
+  <header class="header">
+    <div class="header-logo" aria-label="OpenClaw Cron Dashboard">
+      <!-- Claw / schedule icon -->
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <circle cx="12" cy="12" r="10"/>
+        <polyline points="12 6 12 12 16 14"/>
+      </svg>
+      <span>OpenClaw</span>
+    </div>
+    <span class="header-subtitle">Cron Dashboard</span>
+
+    <div class="header-spacer"></div>
+
+    <div class="header-meta">
+      <!-- Auto-refresh countdown -->
+      <div class="refresh-indicator" id="refresh-indicator" title="Auto-refreshes every 30s">
+        <div class="refresh-progress">
+          <div class="refresh-progress-bar" id="refresh-bar"></div>
+        </div>
+        <span id="refresh-countdown">30s</span>
+      </div>
+
+      <span id="last-updated" aria-live="polite"></span>
+      <div class="status-dot loading" id="status-dot" aria-label="Status indicator"></div>
+
+      <!-- Manual refresh button -->
+      <button class="refresh-btn" id="refresh-btn" title="Refresh now (R)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M21.5 2v6h-6M2.5 22v-6h6"/>
+          <path d="M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/>
+        </svg>
+        Refresh
+      </button>
+    </div>
+  </header>
+
+  <!-- ── Main ────────────────────────────────────────────────────────────── -->
+  <main class="main" id="main-content">
+
+    <!-- Stats bar -->
+    <div class="stats-bar" id="stats-bar" aria-label="Summary statistics">
+      <div class="stat-card">
+        <div class="stat-value" id="stat-total">—</div>
+        <div class="stat-label">Total Jobs</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value green" id="stat-ok">—</div>
+        <div class="stat-label">Last Run OK</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value red" id="stat-errors">—</div>
+        <div class="stat-label">Errors</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value yellow" id="stat-disabled">—</div>
+        <div class="stat-label">Disabled</div>
+      </div>
+    </div>
+
+    <!-- Timeline section -->
+    <section class="timeline-section" aria-label="24-hour schedule timeline">
+      <div class="section-header">
+        <h2 class="section-title">Today's Schedule</h2>
+        <span class="section-badge" id="timeline-tz-badge">local</span>
+      </div>
+      <div class="timeline-container">
+        <div class="timeline-canvas-wrap">
+          <canvas id="timeline-canvas" aria-label="Timeline showing cron job firing times across 24 hours"></canvas>
+        </div>
+      </div>
+    </section>
+
+    <!-- Jobs section -->
+    <section class="jobs-section" aria-label="Cron job list">
+      <div class="section-header">
+        <h2 class="section-title">Jobs</h2>
+        <span class="section-badge" id="jobs-count-badge">0</span>
+      </div>
+
+      <!-- Initial loading state -->
+      <div class="state-message" id="loading-state">
+        <div class="loader" aria-label="Loading..."></div>
+        <p>Loading cron jobs…</p>
+      </div>
+
+      <!-- Error state -->
+      <div class="state-message hidden" id="error-state">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="48" height="48" aria-hidden="true">
+          <circle cx="12" cy="12" r="10"/>
+          <line x1="12" y1="8" x2="12" y2="12"/>
+          <line x1="12" y1="16" x2="12.01" y2="16"/>
+        </svg>
+        <h3>Failed to load jobs</h3>
+        <p id="error-message">Could not connect to the server. Make sure the dashboard is running and <code>OPENCLAW_CRON_DIR</code> points to a valid cron directory.</p>
+      </div>
+
+      <!-- Empty state -->
+      <div class="state-message hidden" id="empty-state">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="48" height="48" aria-hidden="true">
+          <rect x="3" y="4" width="18" height="18" rx="2"/>
+          <line x1="16" y1="2" x2="16" y2="6"/>
+          <line x1="8" y1="2" x2="8" y2="6"/>
+          <line x1="3" y1="10" x2="21" y2="10"/>
+        </svg>
+        <h3>No jobs found</h3>
+        <p>No cron jobs were found in <code id="empty-cron-dir"></code>. Create some jobs with the OpenClaw CLI and they'll appear here.</p>
+      </div>
+
+      <!-- Jobs grid (populated by JS) -->
+      <div class="jobs-grid" id="jobs-grid" aria-live="polite"></div>
+    </section>
+
+  </main>
+</div>
+
+<!-- ── Run History Panel ──────────────────────────────────────────────────── -->
+<div class="panel-overlay" id="panel-overlay" aria-hidden="true"></div>
+
+<aside class="run-panel" id="run-panel" role="complementary" aria-label="Run history" aria-hidden="true">
+  <div class="panel-header">
+    <div class="panel-title">
+      <div class="panel-job-name" id="panel-job-name">Run History</div>
+      <div class="panel-job-schedule" id="panel-job-schedule"></div>
+    </div>
+    <button class="panel-close-btn" id="panel-close-btn" aria-label="Close run history panel" title="Close (Esc)">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true" width="16" height="16">
+        <line x1="18" y1="6" x2="6" y2="18"/>
+        <line x1="6" y1="6" x2="18" y2="18"/>
+      </svg>
+    </button>
+  </div>
+
+  <div class="panel-body" id="panel-body">
+    <!-- Populated by JS -->
+  </div>
+</aside>
+
+<!-- ── Toast container ───────────────────────────────────────────────────── -->
+<div class="toast-container" id="toast-container" aria-live="polite" aria-atomic="false"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
