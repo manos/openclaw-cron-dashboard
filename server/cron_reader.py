@@ -281,6 +281,9 @@ def _compute_cron_fractions(expr: str | None, tz: str | None) -> list[float]:
     """
     Compute all cron firing fractions for today (midnight → midnight).
     Uses croniter to iterate over the day's firing times.
+
+    Fractions are always in the SERVER's local timezone so dots align
+    with the "now" needle on the frontend timeline.
     """
     if not expr:
         return []
@@ -288,30 +291,38 @@ def _compute_cron_fractions(expr: str | None, tz: str | None) -> list[float]:
     try:
         import zoneinfo
 
-        now = datetime.now()
+        # Server local timezone for output fractions
+        server_tz = datetime.now().astimezone().tzinfo
+        server_now = datetime.now(server_tz)
+        server_midnight = server_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        server_end = server_midnight + timedelta(days=1)
 
-        # If the job has a timezone, compute fractions in that timezone
+        # Iterate cron in the JOB's timezone (or server tz if none)
         if tz:
             try:
-                tzinfo = zoneinfo.ZoneInfo(tz)
-                now = datetime.now(tzinfo)
+                job_tz = zoneinfo.ZoneInfo(tz)
             except (KeyError, Exception):
-                pass  # fall back to server local time
+                job_tz = server_tz
+        else:
+            job_tz = server_tz
 
-        start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        end_of_day = start_of_day + timedelta(days=1)
+        job_now = datetime.now(job_tz)
+        job_midnight = job_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        job_end = job_midnight + timedelta(days=1)
 
-        # Start iteration from just before midnight
-        iter_start = start_of_day - timedelta(seconds=1)
+        # Iterate from just before the job's midnight
+        iter_start = job_midnight - timedelta(seconds=1)
         cron = croniter(expr, iter_start)
 
         fractions: list[float] = []
         for _ in range(300):  # safety cap
             next_time = cron.get_next(datetime)
-            if next_time >= end_of_day:
+            if next_time >= job_end:
                 break
-            if next_time >= start_of_day:
-                frac = (next_time - start_of_day).total_seconds() / 86400
+            if next_time >= job_midnight:
+                # Convert to server local time for fraction calculation
+                server_time = next_time.astimezone(server_tz)
+                frac = (server_time - server_midnight).total_seconds() / 86400
                 if 0 <= frac < 1:
                     fractions.append(frac)
 
@@ -385,6 +396,9 @@ def _compute_weekly_cron_fractions(
     """
     Compute cron firing fractions for each day of the current week (Mon-Sun).
     Accounts for day-of-week restrictions in the cron expression.
+
+    Fractions are in the SERVER's local timezone so dots align with the
+    "now" needle on the frontend.
     """
     empty = {k: [] for k in _WEEK_DAY_KEYS}
     if not expr:
@@ -394,13 +408,16 @@ def _compute_weekly_cron_fractions(
         import zoneinfo
         from datetime import date as _date
 
+        # Server local timezone for output fractions
+        server_tz = datetime.now().astimezone().tzinfo
+
         today = _date.today()
         monday = today - timedelta(days=today.weekday())
 
-        tzinfo = None
+        job_tz = None
         if tz:
             try:
-                tzinfo = zoneinfo.ZoneInfo(tz)
+                job_tz = zoneinfo.ZoneInfo(tz)
             except Exception:
                 pass
 
@@ -408,10 +425,11 @@ def _compute_weekly_cron_fractions(
         for i, key in enumerate(_WEEK_DAY_KEYS):
             day_date = monday + timedelta(days=i)
 
-            if tzinfo:
+            # Iterate cron in the job's timezone
+            if job_tz:
                 start_of_day = datetime(
                     day_date.year, day_date.month, day_date.day,
-                    0, 0, 0, tzinfo=tzinfo,
+                    0, 0, 0, tzinfo=job_tz,
                 )
             else:
                 start_of_day = datetime(
@@ -422,13 +440,21 @@ def _compute_weekly_cron_fractions(
             iter_start = start_of_day - timedelta(seconds=1)
             cron = croniter(expr, iter_start)
 
+            # Server midnight for this day (for fraction calc)
+            server_day_midnight = datetime(
+                day_date.year, day_date.month, day_date.day,
+                0, 0, 0, tzinfo=server_tz,
+            )
+
             fractions: list[float] = []
             for _ in range(300):  # safety cap
                 next_time = cron.get_next(datetime)
                 if next_time >= end_of_day:
                     break
                 if next_time >= start_of_day:
-                    frac = (next_time - start_of_day).total_seconds() / 86400
+                    # Convert to server local time
+                    server_time = next_time.astimezone(server_tz)
+                    frac = (server_time - server_day_midnight).total_seconds() / 86400
                     if 0 <= frac < 1:
                         fractions.append(frac)
 
