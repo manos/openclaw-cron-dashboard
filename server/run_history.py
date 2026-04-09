@@ -1,14 +1,15 @@
 """
 run_history.py
-Fetches run history for a cron job by shelling out to the OpenClaw CLI.
-Parses JSON from stdout, ignoring stderr config warnings.
+Reads run history for a cron job directly from JSONL files on disk.
+Falls back to OpenClaw CLI if direct file reading isn't available.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
-import subprocess
+from pathlib import Path
 
 
 # Job IDs must be UUID-like: alphanumeric and hyphens only
@@ -16,11 +17,14 @@ _VALID_JOB_ID = re.compile(r"^[a-zA-Z0-9-]+$")
 
 
 def get_run_history(
-    job_id: str, openclaw_bin: str = "openclaw", limit: int = 50
+    job_id: str,
+    cron_dir: str = "/data/cron",
+    openclaw_bin: str = "openclaw",
+    limit: int = 50,
 ) -> tuple[list[dict], str | None]:
     """
     Fetch run history for a given job ID.
-    Shells out to: openclaw cron runs --id <jobId>
+    Reads directly from JSONL run files in the cron directory.
 
     Returns:
         (entries, error) — entries is a list of normalized run dicts,
@@ -32,46 +36,41 @@ def get_run_history(
     if not _VALID_JOB_ID.match(job_id):
         return [], "Invalid job ID format"
 
-    try:
-        result = subprocess.run(
-            [openclaw_bin, "cron", "runs", "--id", job_id],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-    except FileNotFoundError:
-        return [], f"OpenClaw binary not found: {openclaw_bin}"
-    except subprocess.TimeoutExpired:
-        return [], "CLI timed out after 15 seconds"
-    except Exception as e:
-        print(f"[run_history] subprocess failed for job {job_id}: {e}")
-        return [], f"CLI execution failed: {e}"
-
-    stdout = (result.stdout or "").strip()
-    if not stdout:
+    runs_dir = Path(cron_dir) / "runs"
+    if not runs_dir.exists():
         return [], None
 
-    # Filter config warning lines from stdout before JSON parsing
-    json_lines = "\n".join(
-        line
-        for line in stdout.splitlines()
-        if not line.startswith("Config was last written")
-    ).strip()
-
-    if not json_lines:
-        return [], None
+    # Collect all run entries for this job from all JSONL files
+    entries: list[dict] = []
 
     try:
-        parsed = json.loads(json_lines)
-    except json.JSONDecodeError as e:
-        print(f"[run_history] JSON parse failed for job {job_id}: {e}")
-        return [], "Failed to parse CLI output as JSON"
+        for run_file in runs_dir.iterdir():
+            if not run_file.suffix == ".jsonl":
+                continue
+            try:
+                with open(run_file, "r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            entry = json.loads(line)
+                            if entry.get("jobId") == job_id:
+                                entries.append(entry)
+                        except json.JSONDecodeError:
+                            continue
+            except (OSError, PermissionError):
+                continue
+    except (OSError, PermissionError) as e:
+        return [], f"Cannot read runs directory: {e}"
 
-    raw_entries = parsed if isinstance(parsed, list) else parsed.get("entries", [])
+    # Sort by timestamp descending (most recent first)
+    entries.sort(key=lambda e: e.get("ts", 0), reverse=True)
 
-    entries = [_normalize_entry(e) for e in raw_entries[:limit]]
+    # Normalize and limit
+    normalized = [_normalize_entry(e) for e in entries[:limit]]
 
-    return entries, None
+    return normalized, None
 
 
 def _normalize_entry(entry: dict) -> dict:

@@ -90,7 +90,7 @@ def job_runs(job_id: str, limit: int = Query(default=50, le=200, ge=1)):
     Shells out to: openclaw cron runs --id <job_id>
     """
     try:
-        entries, error = get_run_history(job_id, OPENCLAW_BIN, limit)
+        entries, error = get_run_history(job_id, CRON_DIR, OPENCLAW_BIN, limit)
 
         return {
             "entries": entries,
