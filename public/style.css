@@ -267,6 +267,55 @@ code, pre {
   width: 100%;
 }
 
+/* ─── View Toggle Tabs ───────────────────────────────────────── */
+
+.view-toggle {
+  display: flex;
+  align-items: center;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 2px;
+  gap: 2px;
+}
+
+.view-tab {
+  padding: 0.2rem 0.65rem;
+  font-size: 0.75rem;
+  font-weight: 500;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  border-radius: calc(var(--radius) - 2px);
+  transition: all var(--transition);
+  font-family: inherit;
+  line-height: 1.6;
+  white-space: nowrap;
+}
+
+.view-tab:hover {
+  color: var(--text-primary);
+  background: var(--bg-hover);
+}
+
+.view-tab.active {
+  background: var(--bg-surface);
+  border-color: var(--border);
+  color: var(--text-primary);
+}
+
+/* ─── Weekly Canvas ───────────────────────────────────────────── */
+
+.weekly-canvas-wrap {
+  min-width: 720px; /* 140px labels + 7×80px cols + 20px right */
+  overflow-x: auto;
+}
+
+#weekly-canvas {
+  display: block;
+}
+
 /* ─── Job Grid ─────────────────────────────────────────────────────────────── */
 
 .jobs-section { margin-bottom: 1.5rem; }

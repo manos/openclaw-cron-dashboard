@@ -63,6 +63,8 @@ def _enrich_job(job: dict) -> dict:
         "scheduleHuman": _humanize_schedule(schedule),
         # Firing times as fractions of day [0, 1) for timeline rendering
         "firingFractions": _compute_firing_fractions(schedule),
+        # Firing fractions per day of current week {"mon": [...], ...}
+        "weeklyFiringFractions": compute_weekly_fractions(schedule),
         # Payload metadata
         "model": payload.get("model"),
         "channel": delivery.get("channel"),
@@ -317,3 +319,122 @@ def _compute_cron_fractions(expr: str | None, tz: str | None) -> list[float]:
 
     except Exception:
         return []
+
+
+# ─── Weekly Firing Fractions ───────────────────────────────────────────────────
+
+
+_WEEK_DAY_KEYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+
+def compute_weekly_fractions(schedule: dict) -> dict[str, list[float]]:
+    """
+    Compute firing times as fractions of each day for the current week (Mon-Sun).
+    Returns a dict like {"mon": [0.39, 0.52], "tue": [...], ...}
+    where each value is a list of fractions in [0, 1).
+    """
+    kind = schedule.get("kind")
+    empty = {k: [] for k in _WEEK_DAY_KEYS}
+
+    if not kind:
+        return empty
+
+    if kind == "cron":
+        return _compute_weekly_cron_fractions(
+            schedule.get("expr"), schedule.get("tz")
+        )
+
+    if kind == "every":
+        # Interval-based: same firing pattern every day
+        fracs = _compute_firing_fractions(schedule)
+        return {k: fracs for k in _WEEK_DAY_KEYS}
+
+    if kind == "at":
+        # One-shot: only fires on the specific date if it's this week
+        at_val = schedule.get("at")
+        if not at_val:
+            return empty
+        try:
+            from datetime import date as _date
+
+            d = datetime.fromisoformat(str(at_val))
+            today = _date.today()
+            monday = today - timedelta(days=today.weekday())
+            sunday = monday + timedelta(days=6)
+
+            fire_date = d.date() if hasattr(d, "date") else today
+            if not (monday <= fire_date <= sunday):
+                return empty
+
+            day_idx = fire_date.weekday()  # 0=Mon, 6=Sun
+            midnight = d.replace(hour=0, minute=0, second=0, microsecond=0)
+            frac = (d - midnight).total_seconds() / 86400
+            result = {k: [] for k in _WEEK_DAY_KEYS}
+            if 0 <= frac < 1:
+                result[_WEEK_DAY_KEYS[day_idx]] = [frac]
+            return result
+        except (ValueError, TypeError):
+            return empty
+
+    return empty
+
+
+def _compute_weekly_cron_fractions(
+    expr: str | None, tz: str | None
+) -> dict[str, list[float]]:
+    """
+    Compute cron firing fractions for each day of the current week (Mon-Sun).
+    Accounts for day-of-week restrictions in the cron expression.
+    """
+    empty = {k: [] for k in _WEEK_DAY_KEYS}
+    if not expr:
+        return empty
+
+    try:
+        import zoneinfo
+        from datetime import date as _date
+
+        today = _date.today()
+        monday = today - timedelta(days=today.weekday())
+
+        tzinfo = None
+        if tz:
+            try:
+                tzinfo = zoneinfo.ZoneInfo(tz)
+            except Exception:
+                pass
+
+        result: dict[str, list[float]] = {}
+        for i, key in enumerate(_WEEK_DAY_KEYS):
+            day_date = monday + timedelta(days=i)
+
+            if tzinfo:
+                start_of_day = datetime(
+                    day_date.year, day_date.month, day_date.day,
+                    0, 0, 0, tzinfo=tzinfo,
+                )
+            else:
+                start_of_day = datetime(
+                    day_date.year, day_date.month, day_date.day, 0, 0, 0
+                )
+
+            end_of_day = start_of_day + timedelta(days=1)
+            iter_start = start_of_day - timedelta(seconds=1)
+            cron = croniter(expr, iter_start)
+
+            fractions: list[float] = []
+            for _ in range(300):  # safety cap
+                next_time = cron.get_next(datetime)
+                if next_time >= end_of_day:
+                    break
+                if next_time >= start_of_day:
+                    frac = (next_time - start_of_day).total_seconds() / 86400
+                    if 0 <= frac < 1:
+                        fractions.append(frac)
+
+            result[key] = fractions
+
+        return result
+
+    except Exception:
+        return empty

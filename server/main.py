@@ -106,6 +106,87 @@ def job_runs(job_id: str, limit: int = Query(default=50, le=200, ge=1)):
         }
 
 
+@app.get("/api/weekly-runs")
+def weekly_runs():
+    """
+    Run statuses for the past 7 days, bucketed by job and calendar day (UTC).
+    Returns:
+      {
+        "days": ["2026-04-03", ...],   # 7 dates Mon→Sun of current week
+        "jobs": {
+          "<jobId>": {
+            "2026-04-03": [{"status": "ok", "ts": 1234567890000}, ...],
+            ...
+          }
+        }
+      }
+    """
+    import json
+    import time
+    from datetime import datetime, timedelta, timezone
+    from pathlib import Path
+
+    now_utc = datetime.now(timezone.utc)
+    # Build the 7-day window: today minus 6 days → today
+    cutoff_dt = now_utc - timedelta(days=7)
+    cutoff_ms = int(cutoff_dt.timestamp() * 1000)
+
+    # Collect dates for current week Mon-Sun (calendar dates in UTC)
+    today_date = now_utc.date()
+    monday = today_date - timedelta(days=today_date.weekday())
+    days = [(monday + timedelta(days=i)).isoformat() for i in range(7)]
+    days_set = set(days)
+
+    runs_dir = Path(CRON_DIR) / "runs"
+    jobs_data: dict[str, dict[str, list[dict]]] = {}
+
+    if runs_dir.exists():
+        try:
+            for run_file in runs_dir.iterdir():
+                if run_file.suffix != ".jsonl":
+                    continue
+                try:
+                    with open(run_file) as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                entry = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+
+                            ts = entry.get("ts") or entry.get("runAtMs")
+                            if not ts or ts < cutoff_ms:
+                                continue
+
+                            job_id = entry.get("jobId")
+                            if not job_id:
+                                continue
+
+                            day = datetime.fromtimestamp(
+                                ts / 1000, tz=timezone.utc
+                            ).strftime("%Y-%m-%d")
+                            if day not in days_set:
+                                continue
+
+                            if job_id not in jobs_data:
+                                jobs_data[job_id] = {}
+                            if day not in jobs_data[job_id]:
+                                jobs_data[job_id][day] = []
+
+                            jobs_data[job_id][day].append({
+                                "status": entry.get("status"),
+                                "ts": ts,
+                            })
+                except (OSError, PermissionError):
+                    continue
+        except (OSError, PermissionError):
+            pass
+
+    return {"days": days, "jobs": jobs_data}
+
+
 # ─── Static file serving ──────────────────────────────────────────────────────
 
 # Mount static files AFTER API routes so /api/* takes priority

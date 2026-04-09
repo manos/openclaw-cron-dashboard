@@ -72,14 +72,23 @@
     </div>
 
     <!-- Timeline section -->
-    <section class="timeline-section" aria-label="24-hour schedule timeline">
+    <section class="timeline-section" aria-label="Schedule timeline">
       <div class="section-header">
-        <h2 class="section-title">Today's Schedule</h2>
+        <h2 class="section-title">Schedule</h2>
+        <div class="view-toggle" role="tablist" aria-label="Timeline view">
+          <button class="view-tab active" id="tab-today" role="tab"
+                  aria-selected="true" aria-controls="timeline-daily">Today</button>
+          <button class="view-tab" id="tab-week" role="tab"
+                  aria-selected="false" aria-controls="timeline-weekly">Week</button>
+        </div>
         <span class="section-badge" id="timeline-tz-badge">local</span>
       </div>
       <div class="timeline-container">
-        <div class="timeline-canvas-wrap">
+        <div class="timeline-canvas-wrap" id="timeline-daily">
           <canvas id="timeline-canvas" aria-label="Timeline showing cron job firing times across 24 hours"></canvas>
+        </div>
+        <div class="timeline-canvas-wrap weekly-canvas-wrap hidden" id="timeline-weekly">
+          <canvas id="weekly-canvas" aria-label="Weekly timeline showing cron job firing times across 7 days"></canvas>
         </div>
       </div>
     </section>

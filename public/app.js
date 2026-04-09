@@ -16,6 +16,8 @@ const API_BASE = ''; // same origin
 // ─── State ────────────────────────────────────────────────────────────────────
 
 let allJobs = [];
+let weeklyData = null;
+let activeView = 'today'; // 'today' | 'week'
 let serverTz = null;
 let activeJobId = null;
 let refreshTimer = null;
@@ -45,6 +47,11 @@ const dom = {
   statDisabled:     $('stat-disabled'),
   timelineTzBadge:  $('timeline-tz-badge'),
   timelineCanvas:   $('timeline-canvas'),
+  weeklyCanvas:     $('weekly-canvas'),
+  tabToday:         $('tab-today'),
+  tabWeek:          $('tab-week'),
+  timelineDaily:    $('timeline-daily'),
+  timelineWeekly:   $('timeline-weekly'),
   panelOverlay:     $('panel-overlay'),
   runPanel:         $('run-panel'),
   panelJobName:     $('panel-job-name'),
@@ -73,6 +80,9 @@ function setupEventListeners() {
   dom.panelCloseBtn.addEventListener('click', closePanel);
   dom.panelOverlay.addEventListener('click', closePanel);
 
+  dom.tabToday.addEventListener('click', () => switchView('today'));
+  dom.tabWeek.addEventListener('click', () => switchView('week'));
+
   // Keyboard shortcuts
   document.addEventListener('keydown', e => {
     if (e.key === 'Escape') closePanel();
@@ -94,12 +104,20 @@ async function loadJobs() {
   dom.refreshBtn.classList.add('spinning');
 
   try {
-    const res = await fetch(`${API_BASE}/api/jobs`);
-    if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+    const [jobsRes, weeklyRes] = await Promise.all([
+      fetch(`${API_BASE}/api/jobs`),
+      fetch(`${API_BASE}/api/weekly-runs`).catch(() => null),
+    ]);
 
-    const data = await res.json();
+    if (!jobsRes.ok) throw new Error(`HTTP ${jobsRes.status}: ${jobsRes.statusText}`);
+
+    const data = await jobsRes.json();
     allJobs = data.jobs || [];
     serverTz = data.serverTz || null;
+
+    if (weeklyRes && weeklyRes.ok) {
+      weeklyData = await weeklyRes.json();
+    }
 
     renderAll(allJobs);
     setStatus('ok');
@@ -139,6 +157,9 @@ function renderAll(jobs) {
     dom.timelineTzBadge.textContent = serverTz;
   }
   renderTimeline(jobs);
+  if (activeView === 'week') {
+    renderWeeklyTimeline(jobs, weeklyData);
+  }
 
   // Job cards
   renderJobCards(jobs);
@@ -323,6 +344,265 @@ function renderTimeline(jobs) {
   ctx.font = `bold 10px ${getComputedStyle(document.body).getPropertyValue('font-family')}`;
   const nowLabel = `${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}`;
   ctx.fillText(nowLabel, Math.min(Math.max(nowX, 25), displayWidth - 25), 10);
+}
+
+// --- View Toggle -----------------------------------------------------------
+
+/**
+ * Switch between Today and Week views.
+ */
+function switchView(view) {
+  activeView = view;
+  const isToday = view === 'today';
+
+  dom.tabToday.classList.toggle('active', isToday);
+  dom.tabToday.setAttribute('aria-selected', String(isToday));
+  dom.tabWeek.classList.toggle('active', !isToday);
+  dom.tabWeek.setAttribute('aria-selected', String(!isToday));
+
+  dom.timelineDaily.classList.toggle('hidden', !isToday);
+  dom.timelineWeekly.classList.toggle('hidden', isToday);
+
+  if (!isToday && allJobs.length > 0) {
+    renderWeeklyTimeline(allJobs, weeklyData);
+  }
+}
+
+// --- Weekly Timeline --------------------------------------------------------
+
+/**
+ * Draw the weekly schedule timeline: 7 day-columns, one row per job.
+ * Dots are color-coded by actual run status from weeklyRunsData.
+ */
+function renderWeeklyTimeline(jobs, weeklyRunsData) {
+  const canvas = dom.weeklyCanvas;
+  const ctx = canvas.getContext('2d');
+
+  const enabledJobs = jobs.filter(j => j.enabled && j.weeklyFiringFractions);
+
+  const PADDING_LEFT     = 140;
+  const PADDING_RIGHT    = 20;
+  const DAY_LABEL_HEIGHT = 32;
+  const ROW_HEIGHT       = 28;
+  const DOT_RADIUS       = 3.5;
+  const MIN_COL_WIDTH    = 80;
+  const NUM_DAYS         = 7;
+
+  const totalRows = Math.max(enabledJobs.length, 1);
+  const canvasHeight = DAY_LABEL_HEIGHT + totalRows * ROW_HEIGHT + 16;
+
+  const dpr = window.devicePixelRatio || 1;
+  // Canvas must be at least wide enough for 7 columns; can grow wider
+  const containerWidth = canvas.parentElement.clientWidth || 800;
+  const displayWidth = Math.max(
+    containerWidth,
+    PADDING_LEFT + NUM_DAYS * MIN_COL_WIDTH + PADDING_RIGHT
+  );
+
+  canvas.width  = displayWidth * dpr;
+  canvas.height = canvasHeight * dpr;
+  canvas.style.width  = `${displayWidth}px`;
+  canvas.style.height = `${canvasHeight}px`;
+  ctx.scale(dpr, dpr);
+
+  const trackWidth = displayWidth - PADDING_LEFT - PADDING_RIGHT;
+  const colWidth   = trackWidth / NUM_DAYS;
+
+  // Current week dates Mon-Sun (local)
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const mondayOffset = (today.getDay() + 6) % 7; // Mon=0 … Sun=6
+  const monday = new Date(today);
+  monday.setDate(today.getDate() - mondayOffset);
+
+  const weekDates = Array.from({ length: NUM_DAYS }, (_, i) => {
+    const d = new Date(monday);
+    d.setDate(monday.getDate() + i);
+    return d;
+  });
+
+  const todayStr  = today.toISOString().slice(0, 10);
+  const dayKeys   = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
+  const dayLabels = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+
+  // Read CSS custom property colors
+  const style  = getComputedStyle(document.documentElement);
+  const colors = {
+    bgSurface:     style.getPropertyValue('--bg-surface').trim()     || '#161b22',
+    border:        style.getPropertyValue('--border').trim()         || '#30363d',
+    textMuted:     style.getPropertyValue('--text-muted').trim()     || '#6e7681',
+    textSecondary: style.getPropertyValue('--text-secondary').trim() || '#8b949e',
+    textPrimary:   style.getPropertyValue('--text-primary').trim()   || '#e6edf3',
+    accent:        style.getPropertyValue('--accent').trim()         || '#58a6ff',
+    green:         style.getPropertyValue('--green').trim()          || '#3fb950',
+    red:           style.getPropertyValue('--red').trim()            || '#f85149',
+  };
+  const fontFamily = getComputedStyle(document.body).getPropertyValue('font-family');
+
+  // Background
+  ctx.fillStyle = colors.bgSurface;
+  ctx.fillRect(0, 0, displayWidth, canvasHeight);
+
+  // --- Day columns: highlight, separators, labels ---
+  weekDates.forEach((date, colIdx) => {
+    const colX    = PADDING_LEFT + colIdx * colWidth;
+    const dateStr = date.toISOString().slice(0, 10);
+    const isToday = dateStr === todayStr;
+
+    // Today's column highlight
+    if (isToday) {
+      ctx.fillStyle = 'rgba(88, 166, 255, 0.06)';
+      ctx.fillRect(colX, 0, colWidth, canvasHeight);
+    }
+
+    // Vertical separator (skip leftmost — that's the name/track boundary)
+    if (colIdx > 0) {
+      ctx.strokeStyle = colors.border;
+      ctx.lineWidth = 0.5;
+      ctx.beginPath();
+      ctx.moveTo(colX, 0);
+      ctx.lineTo(colX, canvasHeight);
+      ctx.stroke();
+    }
+
+    // Day label: "Mon 4/7"
+    const monthDay = `${date.getMonth() + 1}/${date.getDate()}`;
+    ctx.textAlign = 'center';
+    ctx.font = `${isToday ? '600' : '400'} 11px ${fontFamily}`;
+    ctx.fillStyle = isToday ? colors.accent : colors.textMuted;
+    ctx.fillText(`${dayLabels[colIdx]} ${monthDay}`, colX + colWidth / 2, 18);
+  });
+
+  // Left name-column border
+  ctx.strokeStyle = colors.border;
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(PADDING_LEFT, 0);
+  ctx.lineTo(PADDING_LEFT, canvasHeight);
+  ctx.stroke();
+
+  // Header / body separator
+  ctx.strokeStyle = colors.border;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(0, DAY_LABEL_HEIGHT);
+  ctx.lineTo(displayWidth, DAY_LABEL_HEIGHT);
+  ctx.stroke();
+
+  // Empty state
+  if (enabledJobs.length === 0) {
+    ctx.fillStyle = colors.textMuted;
+    ctx.textAlign = 'center';
+    ctx.font = `13px ${fontFamily}`;
+    ctx.fillText(
+      'No scheduled jobs with computable firing times',
+      displayWidth / 2,
+      DAY_LABEL_HEIGHT + ROW_HEIGHT * 0.7
+    );
+    return;
+  }
+
+  // --- Job rows ---
+  enabledJobs.forEach((job, rowIdx) => {
+    const y         = DAY_LABEL_HEIGHT + rowIdx * ROW_HEIGHT;
+    const rowCenterY = y + ROW_HEIGHT / 2;
+
+    // Alternating row background
+    if (rowIdx % 2 === 1) {
+      ctx.fillStyle = 'rgba(255,255,255,0.02)';
+      ctx.fillRect(0, y, displayWidth, ROW_HEIGHT);
+    }
+
+    // Job name label (right-aligned, truncated)
+    const maxNameWidth = PADDING_LEFT - 12;
+    ctx.fillStyle   = colors.textSecondary;
+    ctx.textAlign   = 'right';
+    ctx.font        = `12px ${fontFamily}`;
+    const displayName = truncateText(ctx, job.name, maxNameWidth);
+    ctx.fillText(displayName, PADDING_LEFT - 10, rowCenterY + 4);
+
+    // --- Day cells ---
+    dayKeys.forEach((dayKey, colIdx) => {
+      const colX      = PADDING_LEFT + colIdx * colWidth;
+      const dateStr   = weekDates[colIdx].toISOString().slice(0, 10);
+      const fractions = (job.weeklyFiringFractions || {})[dayKey] || [];
+
+      if (fractions.length === 0) return;
+
+      // Determine color: check actual run data for this job+day
+      const dayRuns   = (weeklyRunsData && weeklyRunsData.jobs &&
+                         weeklyRunsData.jobs[job.id] &&
+                         weeklyRunsData.jobs[job.id][dateStr]) || [];
+      const dayStatus = _weekDayStatus(dayRuns);
+
+      const dotColor = dayStatus === 'ok'    ? colors.green
+                     : dayStatus === 'error' ? colors.red
+                     : colors.accent; // blue = scheduled / no data
+
+      // Track line across the cell
+      ctx.strokeStyle = colors.border;
+      ctx.lineWidth   = 0.8;
+      ctx.beginPath();
+      ctx.moveTo(colX + 3,          rowCenterY);
+      ctx.lineTo(colX + colWidth - 3, rowCenterY);
+      ctx.stroke();
+
+      // Dots at firing fractions
+      for (const frac of fractions) {
+        const dotX = colX + frac * colWidth;
+
+        // Glow halo
+        const grad = ctx.createRadialGradient(
+          dotX, rowCenterY, 0,
+          dotX, rowCenterY, DOT_RADIUS * 2.5
+        );
+        grad.addColorStop(0, dotColor + 'aa');
+        grad.addColorStop(1, dotColor + '00');
+        ctx.fillStyle = grad;
+        ctx.beginPath();
+        ctx.arc(dotX, rowCenterY, DOT_RADIUS * 2.5, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Solid dot
+        ctx.fillStyle = dotColor;
+        ctx.beginPath();
+        ctx.arc(dotX, rowCenterY, DOT_RADIUS, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    });
+  });
+
+  // --- Current-time needle in today's column ---
+  const todayColIdx = weekDates.findIndex(
+    d => d.toISOString().slice(0, 10) === todayStr
+  );
+  if (todayColIdx >= 0) {
+    const now   = new Date();
+    const frac  = (now.getHours() * 3600 + now.getMinutes() * 60 + now.getSeconds()) / 86400;
+    const colX  = PADDING_LEFT + todayColIdx * colWidth;
+    const nowX  = colX + frac * colWidth;
+
+    ctx.strokeStyle = colors.red + 'cc';
+    ctx.lineWidth   = 1.5;
+    ctx.setLineDash([3, 2]);
+    ctx.beginPath();
+    ctx.moveTo(nowX, DAY_LABEL_HEIGHT);
+    ctx.lineTo(nowX, canvasHeight - 4);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+}
+
+/**
+ * Derive a day-level run status from a list of run entries.
+ * Returns 'ok', 'error', or 'none' (no data / future).
+ */
+function _weekDayStatus(dayRuns) {
+  if (!dayRuns || dayRuns.length === 0) return 'none';
+  const hasError = dayRuns.some(r => r.status === 'error' || r.status === 'timeout');
+  if (hasError) return 'error';
+  const hasOk = dayRuns.some(r => r.status === 'ok');
+  return hasOk ? 'ok' : 'none';
 }
 
 /**
@@ -750,6 +1030,11 @@ let resizeDebounce;
 window.addEventListener('resize', () => {
   clearTimeout(resizeDebounce);
   resizeDebounce = setTimeout(() => {
-    if (allJobs.length > 0) renderTimeline(allJobs);
+    if (allJobs.length > 0) {
+      renderTimeline(allJobs);
+      if (activeView === 'week') {
+        renderWeeklyTimeline(allJobs, weeklyData);
+      }
+    }
   }, 150);
 });
