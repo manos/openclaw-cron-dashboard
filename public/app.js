@@ -867,8 +867,8 @@ function renderJobCard(job) {
           <span class="job-stat-value">${escHtml(nextRun)}</span>
         </div>
         <div class="job-stat">
-          <span class="job-stat-label">Delivery</span>
-          <span class="job-stat-value">${escHtml(state.lastDeliveryStatus || '—')}</span>
+          <span class="job-stat-label">Health</span>
+          <span class="job-stat-value">${state.lastStatus === 'ok' || state.lastRunStatus === 'ok' ? '✅ OK' : state.lastStatus === 'error' || state.lastRunStatus === 'error' ? '❌ Error' : escHtml(state.lastStatus || state.lastRunStatus || '—')}</span>
         </div>
       </div>
 
@@ -990,8 +990,10 @@ function renderRunEntry(entry, idx) {
   const model = entry.model || '';
   const summary = entry.summary || null;
 
-  const deliveryClass = entry.deliveryStatus === 'delivered' ? '' : 'failed';
-  const deliveryLabel = entry.deliveryStatus || (entry.delivered === true ? 'delivered' : entry.delivered === false ? 'not delivered' : '—');
+  const runHealthy = entry.status === 'ok';
+  const wasDelivered = entry.deliveryStatus === 'delivered' || entry.delivered === true;
+  const healthLabel = runHealthy ? (wasDelivered ? '✅ delivered' : '✅ silent') : entry.status === 'error' ? '❌ error' : entry.deliveryStatus || '—';
+  const healthClass = runHealthy ? '' : 'failed';
 
   const tokenInfo = entry.usage
     ? `<div class="run-tokens">
@@ -1020,7 +1022,7 @@ function renderRunEntry(entry, idx) {
         <div class="run-meta">
           <span class="run-duration">${escHtml(duration)}</span>
           ${model ? `<span class="run-model" title="${escHtml(model)}">${escHtml(model.split('/').pop() || model)}</span>` : ''}
-          ${deliveryLabel !== '—' ? `<span class="run-delivery ${deliveryClass}">${escHtml(deliveryLabel)}</span>` : ''}
+          ${healthLabel !== '—' ? `<span class="run-delivery ${healthClass}">${escHtml(healthLabel)}</span>` : ''}
         </div>
         <span class="run-expand-icon" aria-hidden="true">▶</span>
       </div>
